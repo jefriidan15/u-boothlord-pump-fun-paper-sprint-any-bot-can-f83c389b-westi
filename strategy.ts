@@ -139,13 +139,19 @@ interface Held {
   devSoldAtOpen: boolean;
 }
 
-const FEE_BPS = 125n;
+const CURVE_FEE_BPS = 125n;
 
-/** What selling `tokens` against (vq, vt) would pay after curve fees (protocol + creator, 95 + 30 bps). */
-function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
-  if (tokens <= 0n || vt <= 0n) return 0n;
-  const q = (tokens * vq) / (vt + tokens);
-  return q - (q * FEE_BPS + BPS - 1n) / BPS;
+/**
+ * Lamports a sale of `amount` tokens would bring back from a curve holding
+ * (`quoteReserves`, `tokenReserves`), after the curve's own fees (95 bps
+ * protocol + 30 bps creator). The fee rounds up, so the net never exceeds
+ * the gross quote the constant-product curve would pay.
+ */
+function netSaleProceeds(amount: bigint, quoteReserves: bigint, tokenReserves: bigint): bigint {
+  if (amount <= 0n || tokenReserves <= 0n) return 0n;
+  const gross = (amount * quoteReserves) / (tokenReserves + amount);
+  const fee = (gross * CURVE_FEE_BPS + BPS - 1n) / BPS;
+  return gross - fee;
 }
 
 export function createStrategy(params: Params = DEFAULT_PARAMS): { onBatch(state: BotState, batch: Batch): OrderInput[] } {
@@ -170,17 +176,25 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): { onBatch(state
     return Math.min(P.maxSplit, P.baseSplit + (behind > P.fillTarget * 0.15 ? 2 : 1));
   }
 
-  /** Sell all of `tokens` as k orders in one reply. */
-  function sellOrders(mint: Pubkey, tokens: bigint, k: number, room: number): OrderInput[] {
-    const n = BigInt(Math.max(1, Math.min(k, room)));
-    const out: OrderInput[] = [];
-    const piece = tokens / n;
-    if (piece === 0n) return [{ side: 'sell', mint, token_amount: tokens, max_slippage_bps: 10_000 }];
-    for (let i = 0n; i < n; i++) {
-      const amt = i === n - 1n ? tokens - piece * (n - 1n) : piece;
-      out.push({ side: 'sell', mint, token_amount: amt, max_slippage_bps: 10_000 });
+  /**
+   * Split a sale of `amount` tokens into at most `wanted` orders (and never
+   * more than `room`) in one reply. The pieces are equal except the last,
+   * which takes whatever is left, so they always add back to `amount`.
+   * A sale too small to split goes out as a single order instead.
+   */
+  function splitSale(mint: Pubkey, amount: bigint, wanted: number, room: number): OrderInput[] {
+    const count = BigInt(Math.max(1, Math.min(wanted, room)));
+    const even = amount / count;
+    if (even === 0n) return [{ side: 'sell', mint, token_amount: amount, max_slippage_bps: 10_000 }];
+    const orders: OrderInput[] = [];
+    let sent = 0n;
+    for (let idx = 0n; idx < count; idx++) {
+      const lastOne = idx === count - 1n;
+      const qty = lastOne ? amount - sent : even;
+      orders.push({ side: 'sell', mint, token_amount: qty, max_slippage_bps: 10_000 });
+      sent += qty;
     }
-    return out;
+    return orders;
   }
 
   /** Buy `amount` lamports as up to k orders in one reply (pieces of at least minPieceLamports). */
@@ -277,6 +291,34 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): { onBatch(state
     return false;
   }
 
+  /**
+   * Whether a position must close right now. `worth` is what the position
+   * would sell for after fees and one more tx fee, `cost` is what went into
+   * it (fill cost plus the tx fees its fills paid), and `open.best` is the
+   * highest `worth` seen so far. The rules, in order:
+   *  - hard stop: down slBps from cost, cut the loser fast;
+   *  - trailing stop: once the best value is up at least trailArmBps over
+   *    cost, a fall of trailBps from that best ends the ride — winners run,
+   *    losers get cut, and there is no fixed take-profit cap;
+   *  - time stop: held maxHold slots or more;
+   *  - creator sold while held (unless they had already sold at open);
+   *  - no trade on the coin for staleSlots slots.
+   * The stop and trailing rules only apply when the cost basis is positive.
+   */
+  function closeNow(slot: number, coin: Coin | undefined, open: Held, worth: bigint, cost: bigint): boolean {
+    if (cost > 0n && worth * BPS <= cost * (BPS - BigInt(P.slBps))) return true;
+    if (
+      cost > 0n &&
+      open.best * BPS >= cost * (BPS + BigInt(P.trailArmBps)) &&
+      worth * BPS <= open.best * (BPS - BigInt(P.trailBps))
+    ) return true;
+    if (slot - open.openedSlot >= P.maxHold) return true;
+    if (coin === undefined) return false;
+    if (P.exitOnDevSell && coin.devSold && !open.devSoldAtOpen) return true;
+    if (slot - coin.lastTradeSlot >= P.staleSlots) return true;
+    return false;
+  }
+
   return {
     onBatch(state, batch) {
       readEvents(batch);
@@ -291,61 +333,66 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): { onBatch(state
       const marks = new Map<Pubkey, { vq: bigint; vt: bigint }>();
       for (const m of batch.marks) marks.set(m.mint, { vq: BigInt(m.virtual_quote_reserves), vt: BigInt(m.virtual_token_reserves) });
 
-      for (const f of batch.fills) {
-        if (f.client_id.startsWith('_')) {
-          held.delete(f.mint);
-          selling.delete(f.mint);
+      for (const fill of batch.fills) {
+        // The harness's own closes carry client ids starting with '_': they
+        // end our bookkeeping for that mint outright, position or not.
+        if (fill.client_id.startsWith('_')) {
+          held.delete(fill.mint);
+          selling.delete(fill.mint);
           continue;
         }
-        if (f.status === 'filled') filled += 1;
-        const h = held.get(f.mint);
-        if (f.status !== 'rejected' && h !== undefined) h.txPaid += BigInt(f.tx_fee_lamports);
-        if (f.side === 'buy' && f.status === 'filled' && h === undefined) {
-          held.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports), best: 0n, devSoldAtOpen: coins.get(f.mint)?.devSold ?? false });
+        if (fill.status === 'filled') filled += 1;
+        const open = held.get(fill.mint);
+        // Every settled fill on a tracked position adds its tx fee to the
+        // position's cost basis; a rejected one pays nothing.
+        if (open !== undefined && fill.status !== 'rejected') open.txPaid += BigInt(fill.tx_fee_lamports);
+        // A filled buy with no record yet opens one, stamped at its slot.
+        if (fill.side === 'buy' && fill.status === 'filled' && open === undefined) {
+          held.set(fill.mint, {
+            openedSlot: fill.slot,
+            txPaid: BigInt(fill.tx_fee_lamports),
+            best: 0n,
+            devSoldAtOpen: coins.get(fill.mint)?.devSold ?? false,
+          });
         }
       }
-      for (const mint of [...selling]) if (!hasPendingSell(state, mint)) selling.delete(mint);
+      // A sale is finished once nothing of it is still pending, and a held
+      // record with no position, no sale in flight and no buy pending is
+      // stale — drop both so they cannot block a later re-entry.
+      for (const mint of [...selling]) {
+        if (!hasPendingSell(state, mint)) selling.delete(mint);
+      }
       for (const mint of [...held.keys()]) {
         if (!state.positions.has(mint) && !selling.has(mint) && !hasPendingBuy(state, mint)) held.delete(mint);
       }
       const k = pieces();
 
-      // Exits first.
-      for (const [mint, pos] of state.positions) {
+      // Exits run before entries: every open position is re-priced each
+      // batch, and sold the moment any exit rule fires.
+      for (const [mint, holding] of state.positions) {
         if (orders.length >= cap) break;
         if (selling.has(mint)) continue;
-        const c = coins.get(mint);
-        let h = held.get(mint);
-        if (h === undefined) {
-          h = { openedSlot: state.slot, txPaid: tx, best: 0n, devSoldAtOpen: c?.devSold ?? false };
-          held.set(mint, h);
+        const coin = coins.get(mint);
+        let open = held.get(mint);
+        if (open === undefined) {
+          // A position with no record yet (a fill we missed) starts fresh
+          // at this slot, charged one tx fee as its opening cost.
+          open = { openedSlot: state.slot, txPaid: tx, best: 0n, devSoldAtOpen: coin?.devSold ?? false };
+          held.set(mint, open);
         }
-        let mk = marks.get(mint);
-        if (mk === undefined) {
-          const cv = state.curves.get(mint);
-          if (cv === undefined) continue;
-          mk = { vq: cv.virtual_quote_reserves, vt: cv.virtual_token_reserves };
+        let mark = marks.get(mint);
+        if (mark === undefined) {
+          const curve = state.curves.get(mint);
+          if (curve === undefined) continue;
+          mark = { vq: curve.virtual_quote_reserves, vt: curve.virtual_token_reserves };
         }
-        const value = sellValue(pos.token_amount, mk.vq, mk.vt) - tx;
-        const basis = pos.cost_lamports + h.txPaid;
-        if (value > h.best) h.best = value;
-        let exit = false;
-        if (basis > 0n) {
-          // Hard stop: cut the loser fast.
-          if (value * BPS <= basis * (BPS - BigInt(P.slBps))) exit = true;
-          // Trailing stop: once up at least trailArmBps, exit on a fall of
-          // trailBps from the best value — winners ride, losers get cut.
-          if (h.best * BPS >= basis * (BPS + BigInt(P.trailArmBps)) && value * BPS <= h.best * (BPS - BigInt(P.trailBps))) exit = true;
-        }
-        if (state.slot - h.openedSlot >= P.maxHold) exit = true;
-        if (c !== undefined) {
-          if (P.exitOnDevSell && c.devSold && !h.devSoldAtOpen) exit = true;
-          if (state.slot - c.lastTradeSlot >= P.staleSlots) exit = true;
-        }
-        if (!exit) continue;
-        orders.push(...sellOrders(mint, pos.token_amount, k, cap - orders.length));
+        const worth = netSaleProceeds(holding.token_amount, mark.vq, mark.vt) - tx;
+        const cost = holding.cost_lamports + open.txPaid;
+        if (worth > open.best) open.best = worth;
+        if (!closeNow(state.slot, coin, open, worth, cost)) continue;
+        orders.push(...splitSale(mint, holding.token_amount, k, cap - orders.length));
         selling.add(mint);
-        if (c !== undefined) c.done = true;
+        if (coin !== undefined) coin.done = true;
       }
 
       // Entries: one buy per launch, only inside the entry window, only if the
