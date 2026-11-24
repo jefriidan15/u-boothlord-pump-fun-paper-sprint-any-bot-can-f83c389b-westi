@@ -92,15 +92,15 @@ export const DEFAULT_PARAMS: Params = {
   skipDevSold: true,
   buySlippageBps: 10_000,
   slBps: 800,
-  trailArmBps: 500,
-  trailBps: 1000,
+  trailArmBps: 300,
+  trailBps: 1500,
   maxHold: 10,
   exitOnDevSell: true,
   staleSlots: 1_000_000,
   fillTarget: 300,
   windowSeconds: 21_600,
   baseSplit: 1,
-  maxSplit: 6,
+  maxSplit: 2,
   minPieceLamports: 2_000_000,
 };
 
